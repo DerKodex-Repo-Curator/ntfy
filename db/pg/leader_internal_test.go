@@ -1,6 +1,7 @@
 package pg
 
 import (
+	"os"
 	"testing"
 	"time"
 
@@ -38,4 +39,35 @@ func TestLeader_Lease_ReleasedIsNeverLeader(t *testing.T) {
 	l := &Leader{renewInterval: 20 * time.Second} // Lease duration 1m, hold-off 2m
 	l.acquiredAt = time.Now().Add(-time.Hour)
 	require.False(t, l.IsLeader())
+}
+
+func TestLeader_RenewalNoticesLostLock(t *testing.T) {
+	// Advisory locks are not replicated: after a database failover the old primary, if still
+	// reachable, answers pings but no longer holds our lock. Renewal must check the lock, not
+	// just the connection, and drop leadership when it is gone.
+	dsn := os.Getenv("NTFY_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("NTFY_TEST_DATABASE_URL not set")
+	}
+	host, err := Open(dsn)
+	require.Nil(t, err)
+	defer host.DB.Close()
+	l := NewLeader(host.DB, time.Now().UnixNano(), 20*time.Millisecond)
+	defer l.Close()
+	deadline := time.Now().Add(5 * time.Second)
+	for !l.IsLeader() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	require.True(t, l.IsLeader())
+	// Take the lock away underneath the live connection
+	l.mu.Lock()
+	conn := l.conn
+	l.mu.Unlock()
+	_, err = conn.ExecContext(t.Context(), "SELECT pg_advisory_unlock_all()")
+	require.Nil(t, err)
+	deadline = time.Now().Add(time.Second)
+	for l.IsLeader() && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	require.False(t, l.IsLeader(), "still leader although the lock is gone")
 }
